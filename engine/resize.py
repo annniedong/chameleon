@@ -5,7 +5,7 @@ one exception would abort every remaining task. It runs layout layers from
 best to safest and returns the first result that passes the engine's own
 check (engine/check.py):
 
-  1. primary layout   (reflow; not built yet)
+  1. reflow           rearrange for the new shape (engine/reflow.py)
   2. safe layout      uniform scale-to-fit, then repair
   3. last resort      boxes clamped into the canvas, no text measurement
   4. pass-through     source elements unchanged, only the canvas replaced
@@ -24,6 +24,7 @@ from typing import Any, Callable
 from engine import check
 from engine.fallback import last_resort, safe_layout
 from engine.normalize import Element, normalize_canvas, normalize_elements
+from engine.reflow import reflow_layout
 
 Layer = Callable[[list[Element], float, float, float, float], None]
 
@@ -31,6 +32,7 @@ Layer = Callable[[list[Element], float, float, float, float], None]
 def _layers() -> list[tuple[str, Layer, bool]]:
     """(name, layout function, whether the check measures text)."""
     return [
+        ("reflow", reflow_layout, True),
         ("safe", safe_layout, True),
         ("last-resort", lambda els, sw, sh, W, H: last_resort(els, W, H), False),
     ]
@@ -38,6 +40,20 @@ def _layers() -> list[tuple[str, Layer, bool]]:
 
 def _round(v: float) -> float:
     return round(float(v), 2)
+
+
+def _quantize(layout: list[Element], W: float, H: float) -> None:
+    """Round to the 2 decimals we emit, in the safe direction: boxes up and
+    font sizes down, so text that fit before rounding still fits after.
+    The check then runs on exactly the values that will be written out."""
+    for el in layout:
+        el.width = math.ceil(el.width * 100) / 100
+        el.height = math.ceil(el.height * 100) / 100
+        el.x = min(round(el.x, 2), math.floor((W - el.width) * 100) / 100)
+        el.y = min(round(el.y, 2), math.floor((H - el.height) * 100) / 100)
+        el.x, el.y = max(el.x, 0.0), max(el.y, 0.0)
+        if el.font_size is not None:
+            el.font_size = max(math.floor(el.font_size * 100) / 100, 1.0)
 
 
 def _is_number(v: Any) -> bool:
@@ -89,6 +105,7 @@ def resize(source: dict[str, Any], target_canvas: dict[str, Any]) -> dict[str, A
         layout = copy.deepcopy(original)
         try:
             layer(layout, src_w, src_h, W, H)
+            _quantize(layout, W, H)
             found = check.problems(layout, original, W, H, check_text=check_text)
             result = _emit(layout, target_canvas, W, H)
         except Exception as exc:
