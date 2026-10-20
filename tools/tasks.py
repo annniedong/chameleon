@@ -173,6 +173,69 @@ MUTATIONS: dict[str, Callable[[Design, random.Random], bool]] = {
     "many_elements": m_many_elements,
 }
 
+LOGO = "solstice_logo_lockup.png"
+
+
+def _base(extra: list[dict[str, Any]]) -> Design:
+    """A plain 1080x1080 design (background, headline, CTA) plus `extra`."""
+    return {
+        "canvas": {"width": 1080, "height": 1080},
+        "elements": [
+            {"id": "bg", "type": "image", "x": 0, "y": 0, "width": 1080, "height": 1080, "z_index": 0,
+             "asset_id": "solstice_bg_gradient.png", "fit": "cover"},
+            {"id": "headline", "type": "text", "x": 140, "y": 420, "width": 800, "height": 160, "z_index": 2,
+             "content": "Summer Together", "font_family": "Solstice Serif", "font_size": 64,
+             "font_weight": "bold", "color": "rgba(255,255,255,1)", "text_align": "center"},
+            {"id": "cta_bg", "type": "shape", "shape_type": "rectangle", "x": 330, "y": 640, "width": 420,
+             "height": 90, "corner_radius": 45, "fill_color": "rgba(232,106,58,1)", "group_id": "cta",
+             "z_index": 3},
+            {"id": "cta_label", "type": "text", "x": 330, "y": 665, "width": 420, "height": 44, "z_index": 4,
+             "content": "Shop the Collab", "font_family": "Solstice Sans", "font_size": 22,
+             "font_weight": "bold", "color": "rgba(255,255,255,1)", "text_align": "center", "group_id": "cta"},
+            *extra,
+        ],
+    }
+
+
+def _logo(eid: str, x: float, y: float, w: float, h: float, **kw: Any) -> dict[str, Any]:
+    return {"id": eid, "type": "image", "x": x, "y": y, "width": w, "height": h, "z_index": 5,
+            "asset_id": LOGO, "fit": "contain", **kw}
+
+
+def _label(eid: str, text: str, x: float, y: float, w: float, h: float, size: float) -> dict[str, Any]:
+    return {"id": eid, "type": "text", "x": x, "y": y, "width": w, "height": h, "z_index": 5,
+            "content": text, "font_family": "Solstice Sans", "font_size": size,
+            "color": "rgba(255,255,255,1)", "text_align": "center"}
+
+
+# Hand-built designs for cases the samples do not cover (co-branding).
+SYNTHETIC: dict[str, Design] = {
+    "cobrand_pair": _base([
+        _logo("brand_a", 180, 80, 300, 100),
+        _label("times", "×", 510, 95, 60, 70, 48),
+        _logo("brand_b", 600, 80, 300, 100),
+    ]),
+    "cobrand_three": _base([
+        _logo("brand_a", 90, 90, 240, 80),
+        {"id": "rule_1", "type": "shape", "shape_type": "rectangle", "x": 358, "y": 95, "width": 4,
+         "height": 70, "fill_color": "rgba(255,255,255,0.8)", "z_index": 5},
+        _logo("brand_b", 420, 90, 240, 80),
+        {"id": "rule_2", "type": "shape", "shape_type": "rectangle", "x": 718, "y": 95, "width": 4,
+         "height": 70, "fill_color": "rgba(255,255,255,0.8)", "z_index": 5},
+        _logo("brand_c", 750, 90, 240, 80),
+    ]),
+    "sponsor_strip": _base([
+        _logo("hero_logo", 340, 60, 400, 133),
+        _label("presented_by", "Presented by", 340, 860, 400, 40, 22),
+        *[_logo(f"sponsor_{i}", 70 + i * 190, 920, 150, 50) for i in range(5)],
+    ]),
+    "primary_and_partner": _base([
+        _logo("main_logo", 360, 60, 360, 120),
+        _logo("partner_mark", 900, 990, 120, 40),
+    ]),
+}
+
+
 # Mutated designs are crossed with a few formats that stress them, not the
 # whole catalogue, to keep the run quick.
 MUTATION_FORMATS = ("instagram_story", "web_banner", "leaderboard_ad", "skyscraper_ad", "medium_rectangle_ad")
@@ -188,6 +251,10 @@ def generate(seed: int = 7, include_mutations: bool = True) -> Iterator[dict[str
         same = design["canvas"]
         yield {"task_id": f"{short}__same_size", "mutation": None,
                "source": copy.deepcopy(design), "target_canvas": dict(same)}
+    for name, design in SYNTHETIC.items():
+        for fmt, (w, h) in FORMATS.items():
+            yield {"task_id": f"{name}__{fmt}", "mutation": None,
+                   "source": copy.deepcopy(design), "target_canvas": {"width": w, "height": h}}
     if not include_mutations:
         return
     for name, design in samples.items():

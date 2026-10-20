@@ -64,3 +64,54 @@ def test_every_element_lands_in_exactly_one_unit(task):
     seen = sorted(m.index for u in model.units for m in u.members)
     assert seen == list(range(len(elements)))
     assert all(u.role for u in model.units)
+
+
+def synthetic_model(name: str):
+    design = tasks.SYNTHETIC[name]
+    return understand(normalize_elements(design["elements"], []), 1080, 1080)
+
+
+def logo_units(model):
+    return [u for u in model.units if u.role == "logo"]
+
+
+def test_cobrand_pair_is_one_primary_lockup_with_its_separator():
+    model = synthetic_model("cobrand_pair")
+    [lockup] = logo_units(model)
+    assert lockup.kind == "lockup" and lockup.primary
+    assert [l.id for l in lockup.logos] == ["brand_a", "brand_b"]
+    assert "times" in {m.id for m in lockup.members}
+    assert model.unit_of(next(m.index for m in lockup.members if m.id == "times")) is lockup
+
+
+def test_three_way_lockup_keeps_partner_order_and_rule_separators():
+    [lockup] = logo_units(synthetic_model("cobrand_three"))
+    assert lockup.kind == "lockup"
+    assert [l.id for l in lockup.logos] == ["brand_a", "brand_b", "brand_c"]
+    assert {"rule_1", "rule_2"} <= {m.id for m in lockup.members}
+
+
+def test_sponsor_strip_takes_its_label_and_is_not_primary():
+    model = synthetic_model("sponsor_strip")
+    strips = [u for u in logo_units(model) if u.kind == "strip"]
+    assert len(strips) == 1
+    strip = strips[0]
+    assert [l.id for l in strip.logos] == [f"sponsor_{i}" for i in range(5)]
+    assert "presented_by" in {m.id for m in strip.members}
+    assert not strip.primary
+    assert model.primary_logo.id == "hero_logo"
+    assert model.primary_logo.importance > strip.importance
+
+
+def test_partner_mark_is_a_secondary_logo():
+    model = synthetic_model("primary_and_partner")
+    by_id = {u.id: u for u in model.units}
+    assert by_id["main_logo"].primary
+    assert by_id["partner_mark"].role == "logo" and not by_id["partner_mark"].primary
+    assert by_id["main_logo"].importance > by_id["partner_mark"].importance
+
+
+def test_missing_asset_watermark_is_not_a_logo():
+    model = model_for("level3_advanced")
+    assert roles(model)["holiday_watermark"] == "image"
+    assert model.primary_logo.id == "logo"

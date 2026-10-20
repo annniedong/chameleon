@@ -3,10 +3,14 @@
 The input carries no semantic labels, only type, geometry, grouping and
 styling. This module rebuilds the structure a designer would see:
 
-  units          elements that travel together: an explicit group_id, or a
-                 text sitting inside a shape (a button or a pill)
+  units          elements that travel together: an explicit group_id, a text
+                 sitting inside a shape (a button or a pill), or a row of
+                 logos with its separators and label
   roles          background, hero, logo, headline, subhead, body, cta,
                  badge, legal, decoration, image
+  logo kinds     a single logo, a co-brand "lockup" (equal partners, often
+                 split by "x", "+" or "|"), or a sponsor "strip"; one logo
+                 or lockup is the primary brand mark
   importance     0..1, who keeps space when space runs out
   sets           repeated siblings, such as a row of badges
   reading order  top-to-bottom, left-to-right
@@ -34,6 +38,9 @@ IMPORTANCE = {
     "body": 0.5, "badge": 0.45, "image": 0.35, "legal": 0.2, "decoration": 0.1,
     "background": 0.0,
 }
+# Logos that are not the primary brand mark, and sponsor strips.
+SECONDARY_LOGO_IMPORTANCE = 0.5
+STRIP_IMPORTANCE = 0.45
 
 ACTION_WORDS = re.compile(
     r"^\s*(shop|buy|get|order|learn|sign|join|try|start|book|download|discover|explore|see|view|"
@@ -44,6 +51,13 @@ ACTION_WORDS = re.compile(
 LEGAL_WORDS = re.compile(
     r"terms|conditions|responsibly|prohibited|rights reserved|©|copyright|void where|"
     r"privacy|disclaimer|restrictions apply|see .* for details|\*",
+    re.IGNORECASE,
+)
+SEPARATOR_TEXT = re.compile(r"^\s*([×xX+|&/·•:]|\+\+|—|–|-)\s*$")
+LOGO_LABEL = re.compile(
+    r"^\s*(presented by|sponsored by|in partnership with|in association with|powered by|"
+    r"brought to you by|with support from|supported by|official partners?|our partners|partners?:?|"
+    r"in collaboration with|co-presented by|as seen (on|in))\b",
     re.IGNORECASE,
 )
 
@@ -59,6 +73,11 @@ class Unit:
     importance: float = 0.5
     set_id: str | None = None
     why: str = ""
+    # For logos: "single", "lockup" or "strip", and whether it is the brand's
+    # primary mark. `logos` lists the logo images in left-to-right order.
+    kind: str = "single"
+    primary: bool = False
+    logos: list[Element] = field(default_factory=list)
 
     @property
     def box(self) -> tuple[float, float, float, float]:
@@ -119,6 +138,10 @@ class DesignModel:
         return None
 
     @property
+    def primary_logo(self) -> Unit | None:
+        return next((u for u in self.units if u.role == "logo" and u.primary), None)
+
+    @property
     def reading_order(self) -> list[Unit]:
         """Top to bottom in bands, then left to right within a band."""
         band = max(self.height * 0.04, 1.0)
@@ -153,6 +176,8 @@ def build_units(elements: list[Element], W: float, H: float) -> list[Unit]:
     shapes = [e for e in elements if e.type == "shape" and e.index not in claimed
               and e.width * e.height < 0.25 * W * H]
     for text in (e for e in elements if e.type == "text" and e.index not in claimed):
+        if SEPARATOR_TEXT.match(str(text.props.get("content", ""))):
+            continue  # a "x" between logos is not a button label
         host = next((s for s in shapes if s.index not in claimed and _contains(s, text)), None)
         if host is not None:
             units[f"pair:{host.id}"] = Unit(id=f"{host.id}+{text.id}", members=[host, text])
@@ -165,13 +190,17 @@ def build_units(elements: list[Element], W: float, H: float) -> list[Unit]:
 
 
 # --------------------------------------------------------------------------
-# Roles
+# Helpers
 # --------------------------------------------------------------------------
 
 
 def _asset_is_missing(el: Element) -> bool:
     asset = el.props.get("asset_id")
     return not isinstance(asset, str) or not (ASSETS_DIR / asset).is_file()
+
+
+def _named_logo(el: Element) -> bool:
+    return "logo" in str(el.props.get("asset_id", "")).lower()
 
 
 def _caps_ratio(text: str) -> float:
@@ -184,50 +213,137 @@ def _alpha(color: object) -> float:
     return float(m.group(1)) if m else 1.0
 
 
+def _kinds(u: Unit) -> set[str]:
+    return {m.type for m in u.members}
+
+
+def _same_row(a: Unit, b: Unit) -> bool:
+    h = max(a.height, b.height, 1.0)
+    return abs(a.center[1] - b.center[1]) <= 0.5 * h
+
+
+# --------------------------------------------------------------------------
+# Logos
+# --------------------------------------------------------------------------
+
+
+def _logo_candidates(units: list[Unit], W: float, H: float) -> list[Unit]:
+    """Small, visible, single images: anything that could be a brand mark."""
+    canvas = W * H
+    return [u for u in units
+            if _kinds(u) == {"image"} and len(u.members) == 1
+            and u.area < 0.06 * canvas and u.members[0].opacity >= 0.6
+            and u.members[0].props.get("fit") != "cover"]
+
+
+def _merge_logo_sets(units: list[Unit], W: float, H: float) -> list[Unit]:
+    """Join rows of similar-sized logos, with any separators between them and
+    a label next to them, into one lockup or strip unit."""
+    candidates = sorted(_logo_candidates(units, W, H), key=lambda u: u.center[0])
+    if len(candidates) < 2:
+        return units
+
+    # Chain neighbours on the same row with similar heights and modest gaps.
+    rows: list[list[Unit]] = []
+    for u in candidates:
+        for row in rows:
+            last = row[-1]
+            gap = u.box[0] - last.box[2]
+            ratio = max(u.height, last.height) / max(min(u.height, last.height), 1.0)
+            if _same_row(u, last) and ratio <= 1.8 and gap <= 3 * max(u.height, last.height):
+                row.append(u)
+                break
+        else:
+            rows.append([u])
+
+    texts = [u for u in units if _kinds(u) == {"text"} and len(u.members) == 1]
+    thin_shapes = [u for u in units if _kinds(u) == {"shape"} and len(u.members) == 1
+                   and (u.width <= 0.2 * u.height or u.height <= 0.2 * u.width)]
+    merged_ids: set[int] = set()
+    new_units: list[Unit] = []
+
+    for row in (r for r in rows if len(r) >= 2):
+        x0 = row[0].box[0]
+        x1 = row[-1].box[2]
+        row_h = max(u.height for u in row)
+        top = min(u.box[1] for u in row)
+        between = [u for u in texts + thin_shapes
+                   if x0 < u.center[0] < x1 and _same_row(u, row[0])
+                   and (u in thin_shapes or SEPARATOR_TEXT.match(u.text))]
+        label = next((u for u in texts if LOGO_LABEL.match(u.text) and (
+            (_same_row(u, row[0]) and 0 <= x0 - u.box[2] <= 3 * row_h)
+            or (0 <= top - u.box[3] <= 1.5 * row_h and u.box[0] < x1 and u.box[2] > x0))), None)
+        kind = "lockup" if between and len(row) <= 3 and not label else "strip"
+        members = [m for u in row + between + ([label] if label else []) for m in u.members]
+        logos = [u.members[0] for u in row]
+        why = (f"{len(row)} logos with a separator" if kind == "lockup"
+               else f"{len(row)} logos in a row" + (" under a label" if label else ""))
+        new_units.append(Unit(id="+".join(u.id for u in row), members=members, role="logo",
+                              confidence=0.8, kind=kind, logos=logos, why=why))
+        merged_ids.update(id(u) for u in row + between + ([label] if label else []))
+
+    if not new_units:
+        return units
+    return [u for u in units if id(u) not in merged_ids] + new_units
+
+
+def _pick_primary_logo(units: list[Unit]) -> None:
+    logos = [u for u in units if u.role == "logo"]
+    if not logos:
+        return
+    lockups = [u for u in logos if u.kind == "lockup"]
+    pool = lockups or [u for u in logos if u.kind == "single"] or logos
+
+    def rank(u: Unit) -> tuple:
+        named = any(_named_logo(m) for m in (u.logos or u.members))
+        return (named, u.area / max(len(u.logos), 1), -u.center[1])
+
+    best = max(pool, key=rank)
+    for u in logos:
+        u.primary = u is best and u.kind != "strip"
+
+
+# --------------------------------------------------------------------------
+# Roles
+# --------------------------------------------------------------------------
+
+
 def _classify(units: list[Unit], W: float, H: float) -> None:
     canvas = W * H
     pending: list[Unit] = []
 
     for u in units:
-        kinds = {m.type for m in u.members}
-        x0, y0, x1, y1 = u.box
+        if u.role == "logo" and u.kind in ("lockup", "strip"):
+            continue  # already decided by _merge_logo_sets
+        kinds = _kinds(u)
         if (kinds == {"image"} or kinds == {"shape"}) and u.area >= 0.85 * canvas:
             u.role, u.confidence, u.why = "background", 0.95, "covers the canvas"
             continue
         if kinds == {"shape"}:
             u.role, u.confidence, u.why = "decoration", 0.8, "shape with no text"
             continue
-        if kinds == {"image"}:
-            pending.append(u)
-            continue
         pending.append(u)
 
-    # Images: the largest becomes the hero; small wide ones near an edge are logos.
-    images = sorted((u for u in pending if {m.type for m in u.members} == {"image"}),
-                    key=lambda u: u.area, reverse=True)
+    # Images: the largest becomes the hero. A single image counts as a logo
+    # only with evidence: named like one, or small, wide, near an edge, and
+    # actually present and visible (rules out watermarks and placeholders).
+    images = sorted((u for u in pending if _kinds(u) == {"image"}), key=lambda u: u.area, reverse=True)
     for rank, u in enumerate(images):
         el = u.members[0]
         cx, cy = u.center
         aspect = el.aspect or 1.0
-        asset = str(el.props.get("asset_id", "")).lower()
         near_edge = cy < 0.25 * H or cy > 0.8 * H or cx < 0.2 * W or cx > 0.8 * W
-        if "logo" in asset or (aspect >= 1.8 and u.area < 0.08 * canvas and near_edge):
-            u.role, u.confidence, u.why = "logo", 0.85 if "logo" in asset else 0.6, "small wide image near an edge"
+        visible = not _asset_is_missing(el) and el.opacity >= 0.6
+        if _named_logo(el) and visible:
+            u.role, u.confidence, u.why = "logo", 0.85, "named like a logo"
+        elif aspect >= 1.8 and u.area < 0.08 * canvas and near_edge and visible:
+            u.role, u.confidence, u.why = "logo", 0.6, "small wide image near an edge"
         elif rank == 0 and u.area >= 0.04 * canvas:
             u.role, u.confidence, u.why = "hero", 0.8, "largest image"
         else:
             u.role, u.confidence, u.why = "image", 0.5, "secondary image"
-        if _asset_is_missing(el) and u.role == "image":
-            u.why += " (asset missing)"
-
-    # A design has one logo. Keep the likeliest (named "logo", then topmost).
-    logos = [u for u in images if u.role == "logo"]
-    if len(logos) > 1:
-        keep = max(logos, key=lambda u: ("logo" in str(u.members[0].props.get("asset_id", "")).lower(),
-                                         not _asset_is_missing(u.members[0]), -u.center[1]))
-        for u in logos:
-            if u is not keep:
-                u.role, u.confidence, u.why = "image", 0.5, "small image; another element is the logo"
+            if not visible:
+                u.why += " (asset missing or faint)"
 
     texts = [u for u in pending if u.texts]
     pills = [u for u in texts if any(m.type == "shape" for m in u.members)]
@@ -308,16 +424,27 @@ def _alignment(units: list[Unit], W: float) -> str:
     return "center" if centred >= len(fg) / 2 else "left"
 
 
+def _importance(u: Unit, largest: float) -> float:
+    if u.role == "background":
+        return 0.0
+    if u.role == "logo" and u.kind == "strip":
+        base = STRIP_IMPORTANCE
+    elif u.role == "logo" and not u.primary:
+        base = SECONDARY_LOGO_IMPORTANCE
+    else:
+        base = IMPORTANCE.get(u.role, 0.4)
+    # Within a role, bigger things matter a little more.
+    return round(base * (0.85 + 0.15 * min(u.area / largest, 1.0)) * (0.7 + 0.3 * u.confidence), 3)
+
+
 def understand(elements: list[Element], W: float, H: float) -> DesignModel:
     units = build_units(elements, W, H)
+    units = _merge_logo_sets(units, W, H)
     _classify(units, W, H)
-    largest = max((u.area for u in units if u.role not in ("background",)), default=1.0) or 1.0
+    _pick_primary_logo(units)
+    largest = max((u.area for u in units if u.role != "background"), default=1.0) or 1.0
     for u in units:
-        base = IMPORTANCE.get(u.role, 0.4)
-        # Within a role, bigger things matter a little more.
-        u.importance = round(base * (0.85 + 0.15 * min(u.area / largest, 1.0)) * (0.7 + 0.3 * u.confidence), 3)
-        if u.role == "background":
-            u.importance = 0.0
+        u.importance = _importance(u, largest)
     model = DesignModel(width=W, height=H, units=units)
     model.sets = _find_sets(units)
     model.alignment = _alignment(units, W)
