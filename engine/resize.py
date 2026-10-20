@@ -1,75 +1,106 @@
-"""
-THIS IS THE FILE YOU IMPLEMENT.
+"""CHAMELEON engine entry point.
 
-Everything else in this repo (input loading, output writing, rendering,
-the Dockerfile) is plumbing so you can focus on exactly one function:
-`resize()`. See RULES.md and the design schema for the full contract.
+resize() must never raise: engine/main.py has no try/except around it, so
+one exception would abort every remaining task. It runs layout layers from
+best to safest and returns the first result that passes the engine's own
+check (engine/check.py):
+
+  1. primary layout   (reflow; not built yet)
+  2. safe layout      uniform scale-to-fit, then repair
+  3. last resort      boxes clamped into the canvas, no text measurement
+  4. pass-through     source elements unchanged, only the canvas replaced
+
+Set CHAMELEON_DEBUG=1 to print which layer won and every input repair.
 """
 
-from typing import Any
+from __future__ import annotations
+
+import copy
+import math
+import os
+import sys
+from typing import Any, Callable
+
+from engine import check
+from engine.fallback import last_resort, safe_layout
+from engine.normalize import Element, normalize_canvas, normalize_elements
+
+Layer = Callable[[list[Element], float, float, float, float], None]
+
+
+def _layers() -> list[tuple[str, Layer, bool]]:
+    """(name, layout function, whether the check measures text)."""
+    return [
+        ("safe", safe_layout, True),
+        ("last-resort", lambda els, sw, sh, W, H: last_resort(els, W, H), False),
+    ]
+
+
+def _round(v: float) -> float:
+    return round(float(v), 2)
+
+
+def _is_number(v: Any) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def _emit(layout: list[Element], target: dict[str, Any], W: float, H: float) -> dict[str, Any]:
+    """Write the layout back onto copies of the raw elements, so every field
+    we did not deliberately change (content, colours, unknown extras) passes
+    through exactly as it came in."""
+    elements = []
+    for el in layout:
+        out = copy.deepcopy(el.raw)
+        out["x"], out["y"] = _round(el.x), _round(el.y)
+        out["width"], out["height"] = _round(el.width), _round(el.height)
+        if el.type == "text" and el.font_size is not None:
+            out["font_size"] = _round(el.font_size)
+        for key, value in (("rotation", el.rotation), ("opacity", el.opacity), ("z_index", el.z_index)):
+            if key in out and not _is_number(out[key]):
+                out[key] = value
+        elements.append(out)
+    width = target.get("width") if isinstance(target.get("width"), int) else int(W)
+    height = target.get("height") if isinstance(target.get("height"), int) else int(H)
+    return {"canvas": {"width": width, "height": height}, "elements": elements}
+
+
+def _debug(msg: str) -> None:
+    if os.environ.get("CHAMELEON_DEBUG"):
+        print(f"[resize] {msg}", file=sys.stderr)
 
 
 def resize(source: dict[str, Any], target_canvas: dict[str, Any]) -> dict[str, Any]:
-    """
-    Args:
-        source: {"canvas": {"width": int, "height": int}, "elements": [...]}
-                 — the design at its original size. See
-                 chameleon_design_schema_v0.9.json for the full element spec
-                 (text / image / shape, position, size, rotation, opacity,
-                 z_index, group_id, and type-specific fields).
-        target_canvas: {"width": int, "height": int} — the shape you're
-                 resizing into.
+    notes: list[str] = []
+    try:
+        source = source if isinstance(source, dict) else {}
+        target_canvas = target_canvas if isinstance(target_canvas, dict) else {}
+        src_w, src_h = normalize_canvas(source.get("canvas"), notes)
+        W, H = normalize_canvas(target_canvas, notes)
+        original = normalize_elements(source.get("elements"), notes)
+    except Exception as exc:  # pragma: no cover - parsing itself is defensive
+        _debug(f"could not parse input ({exc!r}); passing it through")
+        return {"canvas": dict(target_canvas), "elements": list(source.get("elements") or [])}
 
-    Returns:
-        A design dict with the SAME shape as `source`:
-        {"canvas": target_canvas, "elements": [...]}
+    for note in notes:
+        _debug(note)
 
-        Hard requirements (see RULES.md for the full list):
-        - Every element `id` in `source` must appear exactly once in your
-          output. Do not add, remove, or invent elements.
-        - Do not regenerate or redraw any asset's pixel content — you are
-          repositioning and resizing the elements you were given, nothing
-          more. This is a disqualifying rule, not a style preference.
-        - Non-background image elements should be kept in proportion
-          (matching the source aspect ratio within ~5%) unless they are a
-          full-bleed / `fit: "cover"` element, which is expected to crop.
-        - `font_size` may change to help text fit. `font_family` and
-          `content` should not, for this stage of scoring (see RULES.md,
-          "Adaptive typography and copy").
-        - Nothing should end up outside `target_canvas`'s bounds.
+    fallback: dict[str, Any] | None = None
+    for name, layer, check_text in _layers():
+        layout = copy.deepcopy(original)
+        try:
+            layer(layout, src_w, src_h, W, H)
+            found = check.problems(layout, original, W, H, check_text=check_text)
+            result = _emit(layout, target_canvas, W, H)
+        except Exception as exc:
+            _debug(f"layer '{name}' raised {exc!r}")
+            continue
+        if not found:
+            _debug(f"layer '{name}' passed")
+            return result
+        _debug(f"layer '{name}' rejected: {found[:5]}")
+        fallback = fallback or result
 
-    This is where your actual approach goes: constraint solving, a learned
-    layout model, heuristics, whatever you choose. Latency is not a scoring
-    concern (see RULES.md) — spend your effort on quality, not speed.
-    """
-
-    # ------------------------------------------------------------------
-    # Naive baseline so this file runs out of the box. This is a uniform
-    # stretch — literally the thing the brief tells you NOT to do ("a
-    # naive program stretches the picture; a good one moves the
-    # furniture"). It's here so `python -m engine.main` produces valid,
-    # schema-correct output on day one. Replace the body of this function;
-    # do not just tune these three lines.
-    # ------------------------------------------------------------------
-    scale_x = target_canvas["width"] / source["canvas"]["width"]
-    scale_y = target_canvas["height"] / source["canvas"]["height"]
-
-    out_elements = []
-    for el in source["elements"]:
-        el = dict(el)  # shallow copy — don't mutate the input
-        el["x"] = el["x"] * scale_x
-        el["y"] = el["y"] * scale_y
-        el["width"] = el["width"] * scale_x
-        el["height"] = el["height"] * scale_y
-        if el["type"] == "text":
-            # font_size scaling isn't required to be uniform — this is
-            # just a starting point. Floored at 1px: the schema requires
-            # font_size >= 1, and an extreme downscale (e.g. a tall poster
-            # squeezed into a short banner) can otherwise compute < 1.
-            el["font_size"] = max(1.0, el["font_size"] * min(scale_x, scale_y))
-        out_elements.append(el)
-
-    return {
-        "canvas": {"width": target_canvas["width"], "height": target_canvas["height"]},
-        "elements": out_elements,
-    }
+    if fallback is not None:
+        return fallback
+    _debug("every layer failed; passing the source through")
+    return {"canvas": {"width": int(W), "height": int(H)}, "elements": copy.deepcopy(source.get("elements") or [])}
