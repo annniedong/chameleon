@@ -25,6 +25,7 @@ class TextBox:
     lines: int
     max_line_width: float
     height: float
+    max_line_chars: int = 0
 
 
 @lru_cache(maxsize=1)
@@ -47,11 +48,34 @@ def _font_style(el: dict[str, Any]) -> tuple[str, str]:
     return weight, _weight_style_to_font_style(weight in _BOLD_WEIGHTS, italic)
 
 
+HINTING_ALLOWANCE_PX = 1.0
+
+
 @lru_cache(maxsize=4096)
 def _char_widths(family: str, weight: str, style: str, size: float, text: str) -> tuple[float, ...]:
+    """Per-glyph advance widths that are safe on any platform.
+
+    Glyph widths depend on where they are measured: FreeType on Linux
+    hints glyphs and rounds each advance to whole pixels, which makes small
+    bold text up to ~23% wider than macOS (CoreText) measures it. We do not
+    know which platform the official renderer runs on, so each glyph gets
+    the larger of the platform's own width and the unhinted width plus a
+    pixel. Text that fits by these widths fits either renderer, and the
+    renderer's own wrap can only produce the same number of lines or fewer.
+    """
+    import skia  # type: ignore
+
     from renderer.converter.wrap import char_widths
 
-    return tuple(char_widths(_font_manager(), family, weight, style, size, text))
+    platform = char_widths(_font_manager(), family, weight, style, size, text)
+    font = skia.Font(skia.Typeface.MakeFromData(_font_manager().lookup(family, weight, style)), size)
+    font.setHinting(skia.FontHinting.kNone)
+    font.setLinearMetrics(True)
+    font.setSubpixel(True)
+    linear = font.getWidths(font.textToGlyphs(text))
+    if len(linear) != len(platform):
+        return tuple(platform)
+    return tuple(max(p, lin + HINTING_ALLOWANCE_PX) for p, lin in zip(platform, linear))
 
 
 def measure(el: dict[str, Any], font_size: float | None = None, width: float | None = None) -> TextBox:
@@ -67,22 +91,26 @@ def measure(el: dict[str, Any], font_size: float | None = None, width: float | N
     box_w = float(width if width is not None else el.get("width", 1.0))
     line_h = float(el.get("line_height", DEFAULT_LINE_HEIGHT))
     if not content:
-        return TextBox(lines=0, max_line_width=0.0, height=0.0)
+        return TextBox(lines=0, max_line_width=0.0, height=0.0, max_line_chars=0)
 
     weight, style = _font_style(el)
     widths = _char_widths(str(el.get("font_family", "")), weight, style, size, content)
     wrapped = wrap_text(content, list(widths), box_w)
 
-    line_widths, current = [], 0.0
+    line_widths, line_chars, current, chars = [], [], 0.0, 0
     for ch, w in zip(wrapped, widths):
         if ch == "\n":
             line_widths.append(current)
-            current = 0.0
+            line_chars.append(chars)
+            current, chars = 0.0, 0
         else:
             current += w
+            chars += 1
     line_widths.append(current)
+    line_chars.append(chars)
     lines = len(line_widths)
-    return TextBox(lines=lines, max_line_width=max(line_widths), height=lines * size * line_h)
+    return TextBox(lines=lines, max_line_width=max(line_widths), height=lines * size * line_h,
+                   max_line_chars=max(line_chars))
 
 
 def fits(el: dict[str, Any], font_size: float | None = None, tolerance: float = 0.5) -> bool:

@@ -25,6 +25,7 @@ import math
 
 import z3
 
+from engine import textmetrics
 from engine.normalize import Element
 from engine.understand import DesignModel, Unit
 
@@ -42,6 +43,15 @@ def _box(out: list[Element], u: Unit) -> tuple[float, float, float, float]:
 
 def _overlaps(a: tuple[float, ...], b: tuple[float, ...], pad: float = 0.0) -> bool:
     return (min(a[2], b[2]) - max(a[0], b[0]) > -pad) and (min(a[3], b[3]) - max(a[1], b[1]) > -pad)
+
+
+def _allowance(u: Unit, out: list[Element]) -> float:
+    """Fixed width (px) in a lone text box that does not scale with the font."""
+    if len(u.members) != 1 or u.members[0].type != "text" or u.rotation:
+        return 0.0
+    el = out[u.members[0].index]
+    box = textmetrics.measure(el.text_props(font_size=el.font_size, width=el.width, height=el.height))
+    return textmetrics.HINTING_ALLOWANCE_PX * box.max_line_chars
 
 
 def _num(v: z3.ArithRef, model: z3.ModelRef) -> float:
@@ -63,6 +73,7 @@ def refine(model: DesignModel, out: list[Element], src_w: float, src_h: float,
     opt = z3.Optimize()
     opt.set("timeout", TIMEOUT_MS)
     xs, ys, ss = {}, {}, {}
+    allowance: dict[str, float] = {}
     floors: dict[str, z3.BoolRef] = {}
     objective = []
     for u in units:
@@ -70,9 +81,14 @@ def refine(model: DesignModel, out: list[Element], src_w: float, src_h: float,
         bw, bh = max(x1 - x0, 1e-3), max(y1 - y0, 1e-3)
         x, y, s = z3.Real(f"x_{u.id}"), z3.Real(f"y_{u.id}"), z3.Real(f"s_{u.id}")
         xs[u.id], ys[u.id], ss[u.id] = x, y, s
+        # A lone text's width is glyphs (which scale with s) plus a fixed
+        # per-glyph allowance (which does not); see textmetrics._char_widths.
+        # Width(s) = bw*s + A*(1 - s) keeps its line breaks at any scale.
+        allowance[u.id] = _allowance(u, out)
         # Margins: never demand more than the candidate already gave this unit.
         m = max(0.0, min(margin, x0, y0, W - x1, H - y1))
-        opt.add(x >= m, y >= m, x + bw * s <= W - m, y + bh * s <= H - m)
+        w_expr = bw * s + allowance[u.id] * (1 - s)
+        opt.add(x >= m, y >= m, x + w_expr <= W - m, y + bh * s <= H - m)
         # Growth is capped relative to the source, like the template scale.
         current = math.sqrt((bw * bh) / max(u.area, 1.0))
         cap = max(1.0, min(GROWTH_CAP, 1.2 * ref / max(current, 1e-6)))
@@ -85,7 +101,7 @@ def refine(model: DesignModel, out: list[Element], src_w: float, src_h: float,
         # Objective terms: size by importance, drift of the centre.
         cx0, cy0 = (x0 + x1) / 2, (y0 + y1) / 2
         dx, dy = z3.Real(f"dx_{u.id}"), z3.Real(f"dy_{u.id}")
-        cx, cy = x + bw * s / 2, y + bh * s / 2
+        cx, cy = x + w_expr / 2, y + bh * s / 2
         opt.add(dx >= cx - cx0, dx >= cx0 - cx, dy >= cy - cy0, dy >= cy0 - cy)
         objective.append(100 * u.importance * s - 40 * u.importance * (dx / W + dy / H))
 
@@ -102,7 +118,9 @@ def refine(model: DesignModel, out: list[Element], src_w: float, src_h: float,
             aw, ah, bw_, bh_ = ax1 - ax0, ay1 - ay0, bx1 - bx0, by1 - by0
             xa, ya, sa, xb, yb, sb = xs[a.id], ys[a.id], ss[a.id], xs[b.id], ys[b.id], ss[b.id]
             g = min(gap, max(bx0 - ax1, ax0 - bx1, by0 - ay1, ay0 - by1, 0.0))
-            sides = [(bx0 - ax1, xa + aw * sa + g <= xb), (ax0 - bx1, xb + bw_ * sb + g <= xa),
+            wa = aw * sa + allowance[a.id] * (1 - sa)
+            wb = bw_ * sb + allowance[b.id] * (1 - sb)
+            sides = [(bx0 - ax1, xa + wa + g <= xb), (ax0 - bx1, xb + wb + g <= xa),
                      (by0 - ay1, ya + ah * sa + g <= yb), (ay0 - by1, yb + bh_ * sb + g <= ya)]
             opt.add(max(sides, key=lambda side: side[0])[1])
 
@@ -132,7 +150,7 @@ def refine(model: DesignModel, out: list[Element], src_w: float, src_h: float,
             src, el = out[m_.index], refined[m_.index]
             el.x = nx + (src.x - x0) * s
             el.y = ny + (src.y - y0) * s
-            el.width, el.height = src.width * s, src.height * s
+            el.width, el.height = src.width * s + allowance[u.id] * (1 - s), src.height * s
             if src.font_size is not None:
                 el.font_size = max(src.font_size * s, 1.0)
     return refined
