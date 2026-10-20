@@ -8,7 +8,9 @@ It rewards what the rubric names and penalises what it punishes:
   legibility  text below a readable size, weighted by importance
   hierarchy   another text ending up larger than the headline
   balance     content huddled in a small or off-centre part of the canvas
-  fidelity    units drifting far from their relative place in the source
+  drift       units moving far from their relative place in the source
+  order       reading order changed (top-to-bottom may become left-to-right,
+              but what came first should still come first)
 """
 
 from __future__ import annotations
@@ -82,6 +84,29 @@ def score(model: DesignModel, els: list[Element], src_w: float, src_h: float, W:
                                           (boxes[u.id][1] + boxes[u.id][3]) / 2 / H - u.center[1] / src_h)
                 for u in content) / weight
 
-    total = size - 2.0 * overlap - 0.6 * legibility - hierarchy - balance - 0.4 * drift
+    order = _order_flips(model, content, boxes, H)
+
+    total = size - 2.0 * overlap - 0.6 * legibility - hierarchy - balance - 0.4 * drift - 0.3 * order
     return {"total": total, "size": size, "overlap": overlap, "legibility": legibility,
-            "hierarchy": hierarchy, "balance": balance, "drift": drift}
+            "hierarchy": hierarchy, "balance": balance, "drift": drift, "order": order}
+
+
+def _order_flips(model: DesignModel, content: list[Unit], boxes: dict, H: float) -> float:
+    """Share of unit pairs whose reading order flipped, importance-weighted."""
+    src_rank = {u.id: i for i, u in enumerate(model.reading_order)}
+    band = max(H * 0.04, 1.0)
+
+    def out_key(u: Unit) -> tuple[float, float]:
+        x0, y0, x1, y1 = boxes[u.id]
+        return round(((y0 + y1) / 2) / band), (x0 + x1) / 2
+
+    flips = total = 0.0
+    for i, a in enumerate(content):
+        for b in content[i + 1:]:
+            if a.id not in src_rank or b.id not in src_rank:
+                continue
+            w = min(a.importance, b.importance)
+            total += w
+            if (src_rank[a.id] < src_rank[b.id]) != (out_key(a) < out_key(b)):
+                flips += w
+    return flips / total if total else 0.0

@@ -19,6 +19,7 @@ from engine.geometry import clamp_into, keeps_aspect
 from engine.layout import fit_scale
 from engine.normalize import Element
 from engine.score import score
+from engine.solve import refine
 from engine.templates import plans
 from engine.understand import DesignModel, understand
 
@@ -80,10 +81,11 @@ def _finish(model: DesignModel, out: list[Element], src_w: float, src_h: float, 
         clamp_into(el, W, H)
 
 
-def candidates(elements: list[Element], src_w: float, src_h: float, W: float, H: float):
+def candidates(elements: list[Element], src_w: float, src_h: float, W: float, H: float,
+               model: DesignModel | None = None):
     """Yield (plan name, laid-out elements, score breakdown) for each plan
     that fits and passes the hard-rule check."""
-    model = understand(elements, src_w, src_h)
+    model = model or understand(elements, src_w, src_h)
     ref = math.sqrt((W * H) / (src_w * src_h))
     shape_change = abs(math.log((W / H) / (src_w / src_h)))
     if shape_change < math.log(1.35):
@@ -108,18 +110,46 @@ def candidates(elements: list[Element], src_w: float, src_h: float, W: float, H:
         yield plan.name, out, score(model, out, src_w, src_h, W, H)
 
 
+REFINE_TOP = 3
+
+
+def _debug(msg: str) -> None:
+    if os.environ.get("CHAMELEON_DEBUG"):
+        print(f"[reflow] {msg}", file=sys.stderr)
+
+
 def reflow_layout(elements: list[Element], src_w: float, src_h: float, W: float, H: float) -> None:
     """Replace `elements` in place with the best reflowed layout.
-    Raises if no plan works, so resize() falls through to a safer layer."""
-    best = None
-    for name, out, s in candidates(elements, src_w, src_h, W, H):
-        if os.environ.get("CHAMELEON_DEBUG"):
-            parts = ", ".join(f"{k}={v:.2f}" for k, v in s.items())
-            print(f"[reflow] {name}: {parts}", file=sys.stderr)
-        if best is None or s["total"] > best[2]["total"]:
-            best = (name, out, s)
-    if best is None:
+    Raises if no plan works, so resize() falls through to a safer layer.
+
+    Every template candidate is scored; the best few are then refined with
+    z3 (engine/solve.py) and re-scored, and the overall best wins."""
+    model = understand(elements, src_w, src_h)
+    pool = []
+    for name, out, s in candidates(elements, src_w, src_h, W, H, model):
+        _debug(f"{name}: " + ", ".join(f"{k}={v:.2f}" for k, v in s.items()))
+        pool.append((name, out, s))
+    if not pool:
         raise RuntimeError("no reflow plan fits")
-    if os.environ.get("CHAMELEON_DEBUG"):
-        print(f"[reflow] chose {best[0]}", file=sys.stderr)
+
+    pool.sort(key=lambda c: c[2]["total"], reverse=True)
+    for name, out, s in list(pool[:REFINE_TOP]):
+        if name == "proportional" and s["total"] >= 10.0:
+            continue  # same shape: keep the designer's layout untouched
+        try:
+            refined = refine(model, out, src_w, src_h, W, H)
+        except Exception as exc:  # z3 problems never cost us the candidate
+            _debug(f"{name}: refine failed ({exc!r})")
+            continue
+        if refined is None:
+            continue
+        _finish(model, refined, src_w, src_h, W, H)
+        if check.problems(refined, elements, W, H):
+            continue
+        rs = score(model, refined, src_w, src_h, W, H)
+        _debug(f"{name}+solve: " + ", ".join(f"{k}={v:.2f}" for k, v in rs.items()))
+        pool.append((f"{name}+solve", refined, rs))
+
+    best = max(pool, key=lambda c: c[2]["total"])
+    _debug(f"chose {best[0]}")
     elements[:] = best[1]
