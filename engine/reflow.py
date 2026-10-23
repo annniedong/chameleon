@@ -111,6 +111,8 @@ def candidates(elements: list[Element], src_w: float, src_h: float, W: float, H:
 
 
 REFINE_TOP = 3
+# Name of the plan the last reflow_layout() call chose, for tools and reports.
+last_choice: str | None = None
 
 
 def _debug(msg: str) -> None:
@@ -151,5 +153,7 @@ def reflow_layout(elements: list[Element], src_w: float, src_h: float, W: float,
         pool.append((f"{name}+solve", refined, rs))
 
     best = max(pool, key=lambda c: c[2]["total"])
+    global last_choice
+    last_choice = best[0]
     _debug(f"chose {best[0]}")
     elements[:] = best[1]

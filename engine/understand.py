@@ -173,8 +173,11 @@ def build_units(elements: list[Element], W: float, H: float) -> list[Unit]:
             claimed.add(el.index)
 
     # Implicit buttons and pills: an ungrouped text inside a smallish shape.
-    shapes = [e for e in elements if e.type == "shape" and e.index not in claimed
-              and e.width * e.height < 0.25 * W * H]
+    # Some exporters (Crello) flatten button shapes into images, so a small,
+    # non-background image can host a text too.
+    shapes = [e for e in elements if e.index not in claimed and e.width * e.height < 0.25 * W * H
+              and (e.type == "shape" or (e.type == "image" and e.props.get("fit") != "cover"))]
+    shapes.sort(key=lambda e: e.width * e.height)  # the tightest host wins
     for text in (e for e in elements if e.type == "text" and e.index not in claimed):
         if SEPARATOR_TEXT.match(str(text.props.get("content", ""))):
             continue  # a "x" between logos is not a button label
