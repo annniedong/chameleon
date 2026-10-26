@@ -167,3 +167,18 @@ def test_compound_texts_keep_their_arrangement_after_resize(fmt):
     assert ys == sorted(ys)
     # the & stays between its two words
     assert out["left"]["x"] < out["amp"]["x"] < out["right"]["x"]
+
+
+def test_words_join_a_loosely_stacked_sentence_but_not_unrelated_lines():
+    loose = [
+        _text("s1", "THIS IS A", 380, 100, 320, 60, 50),
+        _text("s2", "HOUSE", 380, 190, 320, 90, 80),     # gap 30 = 0.6 x 50: too wide for geometry alone
+        _text("s3", "of the", 380, 310, 320, 40, 32),    # starts lowercase with a connector
+        _text("s4", "FUTURE", 380, 370, 320, 90, 80),
+        _text("cta", "Book a viewing today.", 380, 600, 320, 40, 32),
+        _text("tag", "Open house Saturday", 380, 662, 320, 40, 32),  # same gap, but a finished sentence above
+    ]
+    model = understand(normalize_elements(loose, []), 1080, 1080)
+    groups = [sorted(m.id for m in u.members) for u in model.units if len(u.members) > 1]
+    assert ["s1", "s2", "s3", "s4"] in groups
+    assert not any("cta" in g and "tag" in g for g in groups)

@@ -200,6 +200,47 @@ def _words(el: Element) -> int:
     return len(str(el.props.get("content", "")).split())
 
 
+NUMBER = re.compile(r"^[\s$€£¥₹+\-−~]*\d[\d.,:/\s]*[kKmM]?\s*$")
+UNIT = re.compile(r"^\s*(%|‰|°|\$|€|£|¥|₹|x|×|\+|pts?|off|%\s*off|kg|g|ml|l|km|mi|hrs?|min|days?|for\s+\d+|"
+                  r"st|nd|rd|th)\s*$", re.IGNORECASE)
+CONNECTOR_GLYPH = re.compile(r"^\s*[&+×x/·|—–-]\s*$")
+TRAILING_CONNECTOR = re.compile(
+    r"\b(a|an|the|of|and|or|to|for|in|on|at|with|by|from|is|are|your|our|my|this|that|up|until|than|&|\+)\s*$",
+    re.IGNORECASE)
+LEADING_CONNECTOR = re.compile(r"^\s*(of|and|or|to|for|in|on|at|with|by|from|the|a|an|&|\+|until|than)\b",
+                               re.IGNORECASE)
+TERMINAL = re.compile(r"[.!?:;…]\s*$")
+
+
+def _content(el: Element) -> str:
+    return str(el.props.get("content", ""))
+
+
+def _text_link(first: Element, second: Element) -> bool:
+    """Do the WORDS say `first` continues into `second` (in reading order)?
+
+    Cheap language cues, no model: a number followed by its unit ("50" "%"),
+    a currency sign before a number, a lone "&" or "+" between words, or an
+    unfinished phrase ("THIS IS A" -> "HOUSE", "HOUSE" -> "of the").
+    """
+    a, b = _content(first).strip(), _content(second).strip()
+    if not a or not b:
+        return False
+    if NUMBER.match(a) and UNIT.match(b):
+        return True
+    if UNIT.match(a) and NUMBER.match(b) and re.match(r"^[$€£¥₹]", a.strip()):
+        return True
+    # A lone "&" or "+" joins words ("GET WELL" & "FEEL BETTER"), not numbers.
+    if CONNECTOR_GLYPH.match(a) and re.search(r"[^\W\d_]", b):
+        return True
+    if CONNECTOR_GLYPH.match(b) and re.search(r"[^\W\d_]", a):
+        return True
+    if TRAILING_CONNECTOR.search(a) or LEADING_CONNECTOR.match(b):
+        return True
+    # No sentence end, and the next piece starts lowercase: still mid-sentence.
+    return not TERMINAL.search(a) and b[:1].islower()
+
+
 def _joined(a: Element, b: Element) -> bool:
     """Do two texts form one phrase as the designer composed it?
 
@@ -207,6 +248,9 @@ def _joined(a: Element, b: Element) -> bool:
     smaller "%", a large "&" layered behind two words, or "THIS IS A" /
     "HOUSE" / "of the" / "FUTURE" stacked in mixed sizes. Moving those
     pieces independently splits numbers from units and scrambles sentences.
+
+    Geometry is the main evidence (how close the pieces sit); the words
+    (`_text_link`) widen the allowed gap when they say the phrase continues.
     """
     ax0, ay0, ax1, ay1 = a.x, a.y, a.x + a.width, a.y + a.height
     bx0, by0, bx1, by1 = b.x, b.y, b.x + b.width, b.y + b.height
@@ -216,13 +260,23 @@ def _joined(a: Element, b: Element) -> bool:
     # Layered: the boxes overlap noticeably (a glyph behind words).
     if h_overlap > 0 and v_overlap > 0 and h_overlap * v_overlap >= 0.1 * min(a.width * a.height, b.width * b.height):
         return True
-    # Same line, touching: a number and its unit, a word and its accent.
-    if v_overlap >= 0.5 * min(a.height, b.height) and -h_overlap <= 0.8 * small:
-        return True
-    # Stacked short fragments with a tight gap: one phrase over several lines.
-    if (h_overlap >= 0.3 * min(a.width, b.width) and -v_overlap <= 0.35 * small
-            and _words(a) <= 3 and _words(b) <= 3):
-        return True
+    same_line = v_overlap >= 0.5 * min(a.height, b.height)
+    stacked = h_overlap >= 0.3 * min(a.width, b.width)
+    if same_line:
+        left, right = (a, b) if a.x <= b.x else (b, a)
+        linked = _text_link(left, right)
+        # Touching: a number and its unit, a word and its accent. Further
+        # apart only when the words say the phrase continues.
+        return -h_overlap <= (2.0 if linked else 0.8) * small
+    if stacked:
+        top, bottom = (a, b) if a.y <= b.y else (b, a)
+        # Words only widen the gap for pieces that really share a column.
+        linked = h_overlap >= 0.5 * min(a.width, b.width) and _text_link(top, bottom)
+        large = max(a.font_size or 1.0, b.font_size or 1.0)
+        # Mixed sizes ("HOUSE" over "of the") are spaced to the larger type.
+        gap_ok = -v_overlap <= (max(0.9 * small, 0.5 * large) if linked else 0.35 * small)
+        short = max(_words(a), _words(b)) <= (6 if linked else 3)
+        return gap_ok and short
     return False
 
 
