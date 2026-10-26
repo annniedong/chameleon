@@ -115,3 +115,55 @@ def test_missing_asset_watermark_is_not_a_logo():
     model = model_for("level3_advanced")
     assert roles(model)["holiday_watermark"] == "image"
     assert model.primary_logo.id == "logo"
+
+
+def _text(eid, content, x, y, w, h, size):
+    return {"id": eid, "type": "text", "x": x, "y": y, "width": w, "height": h, "content": content,
+            "font_family": "Solstice Sans", "font_size": size, "color": "rgba(255,255,255,1)"}
+
+
+COMPOUND = {
+    "canvas": {"width": 1080, "height": 1080},
+    "elements": [
+        {"id": "bg", "type": "image", "x": 0, "y": 0, "width": 1080, "height": 1080,
+         "asset_id": "solstice_bg_gradient.png", "fit": "cover"},
+        # "50" with a smaller "%" right after it, then "OFF"
+        _text("num", "50", 300, 120, 220, 200, 200),
+        _text("pct", "%", 525, 130, 90, 100, 90),
+        _text("off", "OFF", 525, 235, 140, 70, 60),
+        # a big "&" layered behind two words
+        _text("amp", "&", 470, 430, 140, 220, 200),
+        _text("left", "GET WELL", 250, 500, 220, 50, 40),
+        _text("right", "FEEL BETTER", 600, 500, 260, 50, 40),
+        # one sentence stacked as fragments in mixed sizes
+        _text("s1", "THIS IS A", 380, 760, 320, 60, 50),
+        _text("s2", "HOUSE", 380, 822, 320, 90, 80),
+        _text("s3", "of the", 380, 916, 320, 40, 32),
+        _text("s4", "FUTURE", 380, 958, 320, 90, 80),
+    ],
+}
+
+
+def test_compound_texts_group_as_the_designer_composed_them():
+    model = understand(normalize_elements(COMPOUND["elements"], []), 1080, 1080)
+    groups = [sorted(m.id for m in u.members) for u in model.units if len(u.members) > 1]
+    assert sorted(["num", "off", "pct"]) in groups
+    assert sorted(["amp", "left", "right"]) in groups
+    assert sorted(["s1", "s2", "s3", "s4"]) in groups
+
+
+@pytest.mark.parametrize("fmt", ["leaderboard_ad", "skyscraper_ad", "instagram_story", "web_banner"])
+def test_compound_texts_keep_their_arrangement_after_resize(fmt):
+    from engine.resize import resize
+    from tools.catalogue import FORMATS
+
+    w, h = FORMATS[fmt]
+    out = {e["id"]: e for e in resize(json.loads(json.dumps(COMPOUND)), {"width": w, "height": h})["elements"]}
+    # the % stays immediately right of its number
+    assert out["pct"]["x"] >= out["num"]["x"] + out["num"]["width"] * 0.9
+    assert abs(out["pct"]["y"] - out["num"]["y"]) < out["num"]["height"]
+    # the sentence keeps its reading order, top to bottom
+    ys = [out[k]["y"] for k in ("s1", "s2", "s3", "s4")]
+    assert ys == sorted(ys)
+    # the & stays between its two words
+    assert out["left"]["x"] < out["amp"]["x"] < out["right"]["x"]

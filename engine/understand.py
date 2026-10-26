@@ -186,10 +186,64 @@ def build_units(elements: list[Element], W: float, H: float) -> list[Unit]:
             units[f"pair:{host.id}"] = Unit(id=f"{host.id}+{text.id}", members=[host, text])
             claimed.update({host.index, text.index})
 
+    for cluster in _compound_texts([e for e in elements if e.type == "text" and e.index not in claimed]):
+        units[f"text:{cluster[0].index}"] = Unit(id="+".join(e.id for e in cluster), members=cluster)
+        claimed.update(e.index for e in cluster)
+
     for el in elements:
         if el.index not in claimed:
             units[f"el:{el.index}"] = Unit(id=el.id, members=[el])
     return list(units.values())
+
+
+def _words(el: Element) -> int:
+    return len(str(el.props.get("content", "")).split())
+
+
+def _joined(a: Element, b: Element) -> bool:
+    """Do two texts form one phrase as the designer composed it?
+
+    Designers often build one phrase from several text elements: "50" plus a
+    smaller "%", a large "&" layered behind two words, or "THIS IS A" /
+    "HOUSE" / "of the" / "FUTURE" stacked in mixed sizes. Moving those
+    pieces independently splits numbers from units and scrambles sentences.
+    """
+    ax0, ay0, ax1, ay1 = a.x, a.y, a.x + a.width, a.y + a.height
+    bx0, by0, bx1, by1 = b.x, b.y, b.x + b.width, b.y + b.height
+    h_overlap = min(ax1, bx1) - max(ax0, bx0)
+    v_overlap = min(ay1, by1) - max(ay0, by0)
+    small = min(a.font_size or 1.0, b.font_size or 1.0)
+    # Layered: the boxes overlap noticeably (a glyph behind words).
+    if h_overlap > 0 and v_overlap > 0 and h_overlap * v_overlap >= 0.1 * min(a.width * a.height, b.width * b.height):
+        return True
+    # Same line, touching: a number and its unit, a word and its accent.
+    if v_overlap >= 0.5 * min(a.height, b.height) and -h_overlap <= 0.8 * small:
+        return True
+    # Stacked short fragments with a tight gap: one phrase over several lines.
+    if (h_overlap >= 0.3 * min(a.width, b.width) and -v_overlap <= 0.35 * small
+            and _words(a) <= 3 and _words(b) <= 3):
+        return True
+    return False
+
+
+def _compound_texts(texts: list[Element]) -> list[list[Element]]:
+    """Clusters of two or more texts that read as one phrase (union-find)."""
+    parent = list(range(len(texts)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(len(texts)):
+        for j in range(i + 1, len(texts)):
+            if not texts[i].rotation and not texts[j].rotation and _joined(texts[i], texts[j]):
+                parent[find(i)] = find(j)
+    groups: dict[int, list[Element]] = {}
+    for i, el in enumerate(texts):
+        groups.setdefault(find(i), []).append(el)
+    return [sorted(g, key=lambda e: e.index) for g in groups.values() if len(g) >= 2]
 
 
 # --------------------------------------------------------------------------

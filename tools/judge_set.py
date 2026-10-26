@@ -72,12 +72,14 @@ def main() -> None:
     ap.add_argument("--n", type=int, default=100)
     ap.add_argument("--seed", type=int, default=2026)
     ap.add_argument("--max-size", type=int, default=900)
+    ap.add_argument("--out", default=str(OUT), help="output folder (default build/judge)")
     args = ap.parse_args()
+    out_dir = Path(args.out)
 
     designs = [json.loads(p.read_text()) for p in sorted(DESIGNS_DIR.glob("*.json"))]
     rng = random.Random(args.seed)
     rng.shuffle(designs)
-    (OUT / "img").mkdir(parents=True, exist_ok=True)
+    (out_dir / "img").mkdir(parents=True, exist_ok=True)
 
     order = list(BUCKETS)
     items, errs_total, t0 = [], 0, time.time()
@@ -101,10 +103,10 @@ def main() -> None:
         errs_total += bool(errs)
 
         pid = f"p{len(items) + 1:03d}"
-        render(src, OUT / "img" / f"{pid}_src.jpg", args.max_size)
-        render(out, OUT / "img" / f"{pid}_out.jpg", args.max_size)
-        (OUT / "outputs").mkdir(exist_ok=True)
-        (OUT / "outputs" / f"{pid}.json").write_text(json.dumps({"task": {"source": src, "target_canvas": target},
+        render(src, out_dir / "img" / f"{pid}_src.jpg", args.max_size)
+        render(out, out_dir / "img" / f"{pid}_out.jpg", args.max_size)
+        (out_dir / "outputs").mkdir(exist_ok=True)
+        (out_dir / "outputs" / f"{pid}.json").write_text(json.dumps({"task": {"source": src, "target_canvas": target},
                                                                  "output": out}))
         items.append({
             "id": pid, "design": design["id"], "title": design.get("title", ""),
@@ -116,8 +118,8 @@ def main() -> None:
         })
         print(f"{pid} {design['id']} {sw}x{sh} -> {fmt} [{want}] {items[-1]['plan']}" + (f"  ERRORS: {errs[:2]}" if errs else ""))
 
-    (OUT / "manifest.json").write_text(json.dumps({"seed": args.seed, "items": items}, indent=1))
-    print(f"\n{len(items)} items, {errs_total} with validator errors, {time.time() - t0:.0f}s -> {OUT}")
+    (out_dir / "manifest.json").write_text(json.dumps({"seed": args.seed, "items": items}, indent=1))
+    print(f"\n{len(items)} items, {errs_total} with validator errors, {time.time() - t0:.0f}s -> {out_dir}")
 
 
 if __name__ == "__main__":
