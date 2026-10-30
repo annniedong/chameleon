@@ -18,10 +18,11 @@ from engine.fit import fit_text
 from engine.geometry import clamp_into, keeps_aspect
 from engine.layout import fit_scale
 from engine.normalize import Element
-from engine.score import score
+from engine.score import score, scoring_reference, comparative_score
+from engine.search_config import SearchConfig
 from engine.solve import refine
 from engine.templates import plans
-from engine.understand import DesignModel, understand
+from engine.understand import DesignModel, understand, interpretations
 
 
 def _place_background(model: DesignModel, out: list[Element], W: float, H: float) -> None:
@@ -82,13 +83,25 @@ def _finish(model: DesignModel, out: list[Element], src_w: float, src_h: float, 
 
 
 def candidates(elements: list[Element], src_w: float, src_h: float, W: float, H: float,
-               model: DesignModel | None = None):
+               model: DesignModel | None = None, *, max_attempts: int | None = None,
+               stats: dict | None = None):
     """Yield (plan name, laid-out elements, score breakdown) for each plan
     that fits and passes the hard-rule check."""
     model = model or understand(elements, src_w, src_h)
+    attempts = 0
+
+    def attempt():
+        nonlocal attempts
+        if max_attempts is not None and attempts >= max_attempts:
+            return False
+        attempts += 1
+        if stats is not None:
+            stats["layouts_generated"] += 1
+        return True
+
     ref = math.sqrt((W * H) / (src_w * src_h))
     shape_change = abs(math.log((W / H) / (src_w / src_h)))
-    if shape_change < math.log(1.35):
+    if shape_change < math.log(1.35) and attempt():
         out = _proportional(model, elements, src_w, src_h, W, H)
         _finish(model, out, src_w, src_h, W, H)
         if not check.problems(out, elements, W, H):
@@ -97,6 +110,8 @@ def candidates(elements: list[Element], src_w: float, src_h: float, W: float, H:
                 result["total"] += 10.0  # same shape: the source layout is the answer
             yield "proportional", out, result
     for plan in plans(model, src_w, src_h, W, H):
+        if not attempt():
+            break
         x, y, w, h = plan.region
         # Grow with the canvas, but not far past it: oversized type looks shouty.
         k = fit_scale(plan.root, w, h, k_max=1.2 * ref)
@@ -110,9 +125,9 @@ def candidates(elements: list[Element], src_w: float, src_h: float, W: float, H:
         yield plan.name, out, score(model, out, src_w, src_h, W, H)
 
 
-REFINE_TOP = 3
 # Name of the plan the last reflow_layout() call chose, for tools and reports.
 last_choice: str | None = None
+last_stats: dict = {}
 
 
 def _debug(msg: str) -> None:
@@ -126,21 +141,37 @@ def reflow_layout(elements: list[Element], src_w: float, src_h: float, W: float,
 
     Every template candidate is scored; the best few are then refined with
     z3 (engine/solve.py) and re-scored, and the overall best wins."""
-    model = understand(elements, src_w, src_h)
+    global last_choice, last_stats
+    last_choice = None
+    config = SearchConfig.from_env()
+    base = understand(elements, src_w, src_h)
+    models = interpretations(base, min(config.interpretations, config.candidates), config.ambiguity_margin)
+    reference = scoring_reference(base)
+    last_stats = {"interpretations": len(models), "layouts_generated": 0,
+                  "layouts_valid": 0, "refinements": 0, "winner": None, "score": None}
     pool = []
-    for name, out, s in candidates(elements, src_w, src_h, W, H, model):
-        _debug(f"{name}: " + ", ".join(f"{k}={v:.2f}" for k, v in s.items()))
-        pool.append((name, out, s))
+    # Divide the overall budget fairly; invalid plans count against it too.
+    for i, model in enumerate(models):
+        budget = config.candidates // len(models) + (i < config.candidates % len(models))
+        for name, out, _ in candidates(elements, src_w, src_h, W, H, model,
+                                        max_attempts=budget, stats=last_stats):
+            s = comparative_score(reference, model, out, src_w, src_h, W, H, config)
+            if name == "proportional" and abs(math.log((W/H)/(src_w/src_h))) < .02:
+                s["total"] += 10
+            last_stats["layouts_valid"] += 1
+            _debug(f"interpretation {i} / {name}: score={s['total']:.3f}")
+            pool.append((name, out, s, i, model))
     if not pool:
         raise RuntimeError("no reflow plan fits")
 
-    pool.sort(key=lambda c: c[2]["total"], reverse=True)
-    for name, out, s in list(pool[:REFINE_TOP]):
-        if name == "proportional" and s["total"] >= 10.0:
-            continue  # same shape: keep the designer's layout untouched
+    pool.sort(key=lambda c: (-c[2]["total"], c[3], c[0]))
+    for name, out, s, i, model in list(pool[:config.refine_top]):
+        if name == "proportional" and s["total"] >= 10:
+            continue
+        last_stats["refinements"] += 1
         try:
             refined = refine(model, out, src_w, src_h, W, H)
-        except Exception as exc:  # z3 problems never cost us the candidate
+        except Exception as exc:
             _debug(f"{name}: refine failed ({exc!r})")
             continue
         if refined is None:
@@ -148,12 +179,13 @@ def reflow_layout(elements: list[Element], src_w: float, src_h: float, W: float,
         _finish(model, refined, src_w, src_h, W, H)
         if check.problems(refined, elements, W, H):
             continue
-        rs = score(model, refined, src_w, src_h, W, H)
-        _debug(f"{name}+solve: " + ", ".join(f"{k}={v:.2f}" for k, v in rs.items()))
-        pool.append((f"{name}+solve", refined, rs))
+        rs = comparative_score(reference, model, refined, src_w, src_h, W, H, config)
+        pool.append((f"{name}+solve", refined, rs, i, model))
 
-    best = max(pool, key=lambda c: c[2]["total"])
-    global last_choice
+    best = min(pool, key=lambda c: (-c[2]["total"], c[3], c[0]))
     last_choice = best[0]
-    _debug(f"chose {best[0]}")
+    last_stats.update(winner=best[3], score=best[2]["total"], plan=best[0],
+                      roles={u.id: u.role for u in best[4].units})
+    _debug(f"evaluated {last_stats['layouts_generated']} layouts; "
+           f"selected interpretation {best[3]} / {best[0]}; score={best[2]['total']:.3f}")
     elements[:] = best[1]

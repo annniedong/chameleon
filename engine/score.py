@@ -16,6 +16,7 @@ It rewards what the rubric names and penalises what it punishes:
 from __future__ import annotations
 
 import math
+import copy
 
 from engine.normalize import Element
 from engine.understand import DesignModel, Unit
@@ -56,7 +57,21 @@ def score(model: DesignModel, els: list[Element], src_w: float, src_h: float, W:
             inter = _overlap(boxes[a.id], boxes[b.id])
             if inter > 1:
                 smaller = max(min(_area(boxes[a.id]), _area(boxes[b.id])), 1.0)
-                overlap += (inter / smaller) * max(a.importance, b.importance)
+                source_fraction = _overlap(a.box, b.box) / max(min(a.area, b.area), 1.0)
+                overlap += max(0.0, inter / smaller - source_fraction) * max(a.importance, b.importance)
+
+    # Unit bounding boxes can overlap intentionally while their text does not.
+    # Do not let that allowance hide newly colliding labels within those boxes.
+    text_overlap = 0.0
+    texts = [m for u in model.units for m in u.texts]
+    for i, a in enumerate(texts):
+        for b in texts[i + 1:]:
+            if a.props.get("group_id") and a.props.get("group_id") == b.props.get("group_id"):
+                continue
+            def bounds(el):
+                return (el.x, el.y, el.x + el.width, el.y + el.height)
+            if _overlap(bounds(a), bounds(b)) <= 1 and _overlap(bounds(els[a.index]), bounds(els[b.index])) > 1:
+                text_overlap += 1.0
 
     legibility = 0.0
     for u in content:
@@ -66,13 +81,15 @@ def score(model: DesignModel, els: list[Element], src_w: float, src_h: float, W:
                 legibility += (READABLE_PX - f) / READABLE_PX * u.importance
 
     hierarchy = 0.0
-    headlines = [u for u in content if u.role == "headline"]
-    if headlines:
-        top = max(els[m.index].font_size or 0.0 for m in headlines[0].texts)
-        for u in content:
-            if u.role not in ("headline",) and u.texts:
-                if max(els[m.index].font_size or 0.0 for m in u.texts) > top * 1.05:
-                    hierarchy += 0.3
+    texts = [u for u in content if u.texts]
+    for i, a in enumerate(texts):
+        for b in texts[i + 1:]:
+            if max(a.font_size, b.font_size) <= 1.2 * min(a.font_size, b.font_size):
+                continue
+            af = max(els[m.index].font_size or 0 for m in a.texts)
+            bf = max(els[m.index].font_size or 0 for m in b.texts)
+            if (a.font_size - b.font_size) * (af - bf) < 0:
+                hierarchy += .3
 
     xs0, ys0, xs1, ys1 = zip(*boxes.values())
     union = (min(xs0), min(ys0), max(xs1), max(ys1))
@@ -86,9 +103,9 @@ def score(model: DesignModel, els: list[Element], src_w: float, src_h: float, W:
 
     order = _order_flips(model, content, boxes, H)
 
-    total = size - 2.0 * overlap - 0.6 * legibility - hierarchy - balance - 0.4 * drift - 0.3 * order
+    total = size - 2.0 * text_overlap - 2.0 * overlap - 0.6 * legibility - hierarchy - balance - 0.4 * drift - 0.3 * order
     return {"total": total, "size": size, "overlap": overlap, "legibility": legibility,
-            "hierarchy": hierarchy, "balance": balance, "drift": drift, "order": order}
+            "hierarchy": hierarchy, "balance": balance, "drift": drift, "order": order, "text_overlap": text_overlap}
 
 
 def _order_flips(model: DesignModel, content: list[Unit], boxes: dict, H: float) -> float:
@@ -110,3 +127,56 @@ def _order_flips(model: DesignModel, content: list[Unit], boxes: dict, H: float)
             if (src_rank[a.id] < src_rank[b.id]) != (out_key(a) < out_key(b)):
                 flips += w
     return flips / total if total else 0.0
+
+
+def scoring_reference(model: DesignModel) -> DesignModel:
+    """A fixed source reference, never the labels a candidate chose for itself."""
+    reference = copy.deepcopy(model)
+    for u in reference.units:
+        if u.role in ("background", "decoration") and u.role_scores.get(u.role, 1) < .85:
+            u.role = "image"
+        if u.role not in ("logo", "background"):
+            u.importance = max(.1, u.expected_importance)
+    return reference
+
+
+def relationship_loss(model: DesignModel, els: list[Element], W: float, H: float) -> float:
+    """Preserve nearby source alignments and overlap/layering relationships.
+
+    Membership already enforces explicit grouping. This adds soft geometry
+    evidence between units, independent of their alternative role assignments.
+    """
+    units = [u for u in model.units if u.role != "background"]
+    losses = []
+    for i, a in enumerate(units):
+        for b in units[i + 1:]:
+            aa, bb = _box(els, a), _box(els, b)
+            if _overlap(a.box, b.box) > 1:
+                src = _overlap(a.box, b.box) / max(min(a.area, b.area), 1)
+                dst = _overlap(aa, bb) / max(min(_area(aa), _area(bb)), 1)
+                losses.append(abs(src - dst))
+                continue
+            if math.hypot((a.center[0]-b.center[0])/model.width,
+                          (a.center[1]-b.center[1])/model.height) > .5:
+                continue
+            for axis, src_size, dst_size in ((0, model.width, W), (1, model.height, H)):
+                for sa, sb, da, db in ((a.box[axis], b.box[axis], aa[axis], bb[axis]),
+                                      (a.center[axis], b.center[axis],
+                                       (aa[axis]+aa[axis+2])/2, (bb[axis]+bb[axis+2])/2)):
+                    if abs(sa-sb) <= .015 * src_size:
+                        losses.append(min(1, abs(da-db) / dst_size))
+                        break
+    return sum(losses) / len(losses) if losses else 0.0
+
+
+def comparative_score(reference: DesignModel, model: DesignModel, els: list[Element],
+                      sw: float, sh: float, W: float, H: float, config) -> dict[str, float]:
+    result = score(reference, els, sw, sh, W, H)
+    # A bounded, modest role preference cannot win by reclassifying content
+    # as decoration and thereby making the common visual penalties disappear.
+    role_delta = max(-1.0, min(1.0, score(model, els, sw, sh, W, H)["total"] - result["total"]))
+    prior = (model.log_plausibility - reference.log_plausibility) / max(len(model.units), 1)
+    relations = relationship_loss(reference, els, W, H)
+    result["total"] += config.role_weight * role_delta + config.prior_weight * prior - config.relation_weight * relations
+    result.update(role_preference=role_delta, plausibility=prior, relationships=relations)
+    return result

@@ -16,13 +16,17 @@ styling. This module rebuilds the structure a designer would see:
   reading order  top-to-bottom, left-to-right
   alignment      whether the design is a centred column or left-aligned
 
-Everything here is a heuristic. A wrong role only changes soft preferences
-in the layout, never whether the output is valid.
+Everything here is a heuristic. Roles affect placement as well as soft preferences; uncertainty is explored
+through bounded alternative interpretations before validation.
 """
 
 from __future__ import annotations
 
 import re
+import copy
+import math
+import os
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -79,6 +83,9 @@ class Unit:
     primary: bool = False
     logos: list[Element] = field(default_factory=list)
 
+    role_scores: dict[str, float] = field(default_factory=dict)
+    expected_importance: float = 0.5
+
     @property
     def box(self) -> tuple[float, float, float, float]:
         return (min(m.x for m in self.members), min(m.y for m in self.members),
@@ -127,6 +134,8 @@ class DesignModel:
     units: list[Unit]
     sets: dict[str, list[Unit]] = field(default_factory=dict)
     alignment: str = "center"  # "center" or "left"
+
+    log_plausibility: float = 0.0
 
     def by_role(self, role: str) -> list[Unit]:
         return [u for u in self.units if u.role == role]
@@ -293,7 +302,14 @@ def _compound_texts(texts: list[Element]) -> list[list[Element]]:
     for i in range(len(texts)):
         for j in range(i + 1, len(texts)):
             if not texts[i].rotation and not texts[j].rotation and _joined(texts[i], texts[j]):
-                parent[find(i)] = find(j)
+                left = [k for k in range(len(texts)) if find(k) == find(i)]
+                right = [k for k in range(len(texts)) if find(k) == find(j)]
+                first, second = sorted((texts[i], texts[j]), key=lambda e: (e.y, e.x))
+                # A true phrase may span several lines. Geometry alone needs
+                # complete linkage so A-near-B-near-C cannot merge arbitrary text.
+                if (_text_link(first, second) or
+                        all(_joined(texts[a], texts[b]) for a in left for b in right)):
+                    parent[find(i)] = find(j)
     groups: dict[int, list[Element]] = {}
     for i, el in enumerate(texts):
         groups.setdefault(find(i), []).append(el)
@@ -419,86 +435,107 @@ def _pick_primary_logo(units: list[Unit]) -> None:
 # --------------------------------------------------------------------------
 
 
+def _softmax(logits: dict[str, float]) -> dict[str, float]:
+    peak = max(logits.values())
+    weights = {r: math.exp(v - peak) for r, v in logits.items()}
+    total = sum(weights.values())
+    return {r: v / total for r, v in weights.items()}
+
+
+PROMO = re.compile(r"[$\u20ac\u00a3\u00a5\u20b9]|\d\s*%|\b(off|sale|free|only|save)\b", re.I)
+
+
 def _classify(units: list[Unit], W: float, H: float) -> None:
-    canvas = W * H
-    pending: list[Unit] = []
+    """Add independent feature evidence in log space, then normalize.
 
-    for u in units:
-        if u.role == "logo" and u.kind in ("lockup", "strip"):
-            continue  # already decided by _merge_logo_sets
-        kinds = _kinds(u)
-        if (kinds == {"image"} or kinds == {"shape"}) and u.area >= 0.85 * canvas:
-            u.role, u.confidence, u.why = "background", 0.95, "covers the canvas"
-            continue
-        if kinds == {"shape"}:
-            u.role, u.confidence, u.why = "decoration", 0.8, "shape with no text"
-            continue
-        pending.append(u)
-
-    # Images: the largest becomes the hero. A single image counts as a logo
-    # only with evidence: named like one, or small, wide, near an edge, and
-    # actually present and visible (rules out watermarks and placeholders).
-    images = sorted((u for u in pending if _kinds(u) == {"image"}), key=lambda u: u.area, reverse=True)
-    for rank, u in enumerate(images):
-        el = u.members[0]
-        cx, cy = u.center
-        aspect = el.aspect or 1.0
-        near_edge = cy < 0.25 * H or cy > 0.8 * H or cx < 0.2 * W or cx > 0.8 * W
-        visible = not _asset_is_missing(el) and el.opacity >= 0.6
-        if _named_logo(el) and visible:
-            u.role, u.confidence, u.why = "logo", 0.85, "named like a logo"
-        elif aspect >= 1.8 and u.area < 0.08 * canvas and near_edge and visible:
-            u.role, u.confidence, u.why = "logo", 0.6, "small wide image near an edge"
-        elif rank == 0 and u.area >= 0.04 * canvas:
-            u.role, u.confidence, u.why = "hero", 0.8, "largest image"
-        else:
-            u.role, u.confidence, u.why = "image", 0.5, "secondary image"
-            if not visible:
-                u.why += " (asset missing or faint)"
-
-    texts = [u for u in pending if u.texts]
-    pills = [u for u in texts if any(m.type == "shape" for m in u.members)]
-    plain = [u for u in texts if u not in pills]
-
-    # Buttons and pills: an action phrase makes a CTA, otherwise a badge.
-    for u in pills:
-        words = len(u.text.split())
-        if ACTION_WORDS.search(u.text):
-            u.role, u.confidence, u.why = "cta", 0.9, "action phrase on a button"
-        elif u.rotation or _caps_ratio(u.text) > 0.7 or words <= 3:
-            u.role, u.confidence, u.why = "badge", 0.8, "short label on a pill"
-        else:
-            u.role, u.confidence, u.why = "cta", 0.5, "text on a button"
-    if pills and not any(u.role == "cta" for u in pills):
-        # No action phrase anywhere: the biggest, lowest pill is likely the button.
-        best = max(pills, key=lambda u: (u.area, u.center[1]))
-        if best.area > 1.5 * min(p.area for p in pills):
-            best.role, best.confidence, best.why = "cta", 0.5, "largest pill, no action phrase found"
-
-    if not plain:
-        return
+    Scores are heuristic probabilities, not calibrated estimates. Explicit
+    groups determine membership; roles never split or discard their members.
+    """
+    canvas = max(W * H, 1)
+    plain = [u for u in units if _kinds(u) == {"text"}]
+    headline = max(plain, key=lambda u: (u.font_size, u.area), default=None)
     sizes = sorted({u.font_size for u in plain}, reverse=True)
-    smallest = sizes[-1]
-    headline = max(plain, key=lambda u: (u.font_size, u.area))
-    for u in plain:
-        text = u.text
-        el = u.texts[0]
-        dim = el.opacity < 0.85 or _alpha(el.props.get("color")) < 0.85
-        low = u.center[1] > 0.85 * H
-        if u is headline and len(plain) > 1 or (u is headline and u.font_size >= 0.03 * min(W, H)):
-            u.role, u.confidence, u.why = "headline", 0.9, "largest text"
-        elif ACTION_WORDS.search(text) and len(text.split()) <= 6:
-            u.role, u.confidence, u.why = "cta", 0.7, "short action phrase"
-        elif LEGAL_WORDS.search(text) or (u.font_size == smallest and len(sizes) > 2 and (dim or low)):
-            u.role, u.confidence, u.why = "legal", 0.8 if LEGAL_WORDS.search(text) else 0.55, "small print"
-        elif u.font_size >= sizes[min(1, len(sizes) - 1)] and u is not headline:
-            u.role, u.confidence, u.why = "subhead", 0.6, "second-largest text"
-        elif _caps_ratio(text) > 0.8 and len(text.split()) <= 4:
-            u.role, u.confidence, u.why = "badge", 0.5, "short all-caps label"
+    images = sorted((u for u in units if _kinds(u) == {"image"} and u.area < .85 * canvas
+                     and u.kind == "single"), key=lambda u: -u.area)
+    for u in units:
+        kinds = _kinds(u)
+        area = u.area / canvas
+        names = " ".join(str(m.props.get("asset_id", "")) for m in u.members).lower()
+        opacity = min(m.opacity for m in u.members)
+        cx, cy = u.center
+        edge = cy < .25 * H or cy > .8 * H or cx < .2 * W or cx > .8 * W
+        full = (u.box[0] <= .02 * W and u.box[1] <= .02 * H
+                and u.box[2] >= .98 * W and u.box[3] >= .98 * H)
+        if u.kind in ("lockup", "strip"):
+            logits = {"logo": 5.0, "image": 0.0}
+        elif not u.texts:
+            shape = kinds == {"shape"}
+            logits = {"decoration": 3.5 if shape else -0.5, "image": 0.0 if shape else 1.2}
+            if kinds == {"image"}:
+                largest = bool(images and u is images[0])
+                logits["hero"] = (1.4 if largest else -.4) + min(area * 5, 1.4)
+                logits["logo"] = -2.0
+                if opacity >= .6 and not _asset_is_missing(u.members[0]):
+                    logits["logo"] += 1.1 * (area < .08) + .8 * edge + .9 * (u.width >= 1.8 * u.height)
+                    if "logo" in names:
+                        logits["logo"] += 5
+                logits["decoration"] += 1.4 * (opacity < .6)
+                if any(word in names for word in ("deco", "ornament", "texture", "pattern")):
+                    logits["decoration"] += 3.0
+                if opacity < .6:
+                    logits["hero"] -= 2
+            # Large size alone cannot exclude an element from the layout.
+            if area >= .85:
+                logits["background"] = 1.0 + 2.5 * full
+                logits["background"] += 2 * any(m.props.get("fit") == "cover" for m in u.members)
+                logits["background"] += 1.5 * any(w in names for w in ("bg", "background"))
+                if shape and full:
+                    logits["background"] += 4
         else:
-            u.role, u.confidence, u.why = "body", 0.5, "other text"
-    if headline.role != "headline":
-        headline.role, headline.confidence, headline.why = "headline", 0.6, "only text"
+            words = len(u.text.split())
+            action = bool(ACTION_WORDS.search(u.text)) and words <= 6
+            promo = bool(PROMO.search(u.text))
+            legal = bool(LEGAL_WORDS.search(u.text))
+            pill = bool(kinds & {"shape", "image"})
+            relative = u.font_size / max(sizes[0] if sizes else u.font_size, 1)
+            logits = {"headline": -1.0, "subhead": -.5, "body": .8,
+                      "cta": -1.2, "badge": -.8, "legal": -2.0}
+            logits["headline"] += 3.8 * (u is headline) + .8 * relative - 1.6 * promo - 3 * legal
+            logits["subhead"] += 2.8 * (u is not headline and bool(sizes) and
+                                       u.font_size >= sizes[min(1, len(sizes)-1)])
+            logits["body"] += 1.0 * (words > 6)
+            logits["cta"] += 4.8 * action + 1.0 * pill
+            logits["badge"] += 1.2 * (words <= 4) + .6 * (_caps_ratio(u.text) > .8) + 2.0 * promo
+            logits["legal"] += 6.0 * legal
+            if sizes and u.font_size == sizes[-1] and len(sizes) > 2:
+                logits["legal"] += 2.8 * (cy > .85 * H or opacity < .85)
+            if pill:
+                logits["headline"] -= 3
+                logits["subhead"] -= 3
+                logits["badge"] += 2.5
+                if action and not promo:
+                    logits["cta"] += 3.5
+            u.why = "text size, wording, position and grouping"
+        scores = _softmax(logits)
+        # Special placement needs strong evidence. Keep weak hypotheses as
+        # foreground choices; the search may still explore a credible alternative.
+        for special, threshold in (("background", .85),):
+            if special in scores and scores[special] < threshold:
+                del logits[special]
+        scores = _softmax(logits)
+        if max(scores, key=scores.get) == "decoration" and scores["decoration"] < .55:
+            # A conservative prior breaks weak decoration/foreground ties.
+            # Keep the competing hypothesis, but do not give it special
+            # placement in the most likely model on weak evidence alone.
+            logits["decoration"] = max(v for r, v in logits.items() if r != "decoration") - 1e-6
+        u.role_scores = _softmax(logits)
+        u.role = max(u.role_scores, key=u.role_scores.get)
+        u.confidence = u.role_scores[u.role]
+        u.why = u.why or "area, aspect, visibility, position and asset name"
+        if os.environ.get("CHAMELEON_DEBUG"):
+            print("[understand] " + u.id + ": " + " ".join(
+                f"{r}={v:.2f}" for r, v in sorted(u.role_scores.items(), key=lambda x: -x[1])),
+                file=sys.stderr)
 
 
 # --------------------------------------------------------------------------
@@ -548,15 +585,67 @@ def _importance(u: Unit, largest: float) -> float:
     return round(base * (0.85 + 0.15 * min(u.area / largest, 1.0)) * (0.7 + 0.3 * u.confidence), 3)
 
 
-def understand(elements: list[Element], W: float, H: float) -> DesignModel:
-    units = build_units(elements, W, H)
-    units = _merge_logo_sets(units, W, H)
-    _classify(units, W, H)
-    _pick_primary_logo(units)
-    largest = max((u.area for u in units if u.role != "background"), default=1.0) or 1.0
-    for u in units:
-        u.importance = _importance(u, largest)
-    model = DesignModel(width=W, height=H, units=units)
-    model.sets = _find_sets(units)
-    model.alignment = _alignment(units, W)
+def _refresh(model: DesignModel) -> DesignModel:
+    for u in model.units:
+        u.primary = False
+        u.set_id = None
+        u.confidence = u.role_scores.get(u.role, u.confidence)
+    _pick_primary_logo(model.units)
+    largest = max((u.area for u in model.units if u.role != "background"), default=1) or 1
+    for u in model.units:
+        u.expected_importance = sum(p * IMPORTANCE[r] for r, p in u.role_scores.items())
+        assigned = _importance(u, largest)
+        # Retain the role chosen by this interpretation while damping brittle
+        # changes in priority. Brand conventions retain their existing priority.
+        u.importance = (assigned if u.role in ("logo", "background")
+                        else .75 * assigned + .25 * u.expected_importance)
+    model.sets = _find_sets(model.units)
+    model.alignment = _alignment(model.units, model.width)
+    model.log_plausibility = sum(math.log(max(u.role_scores.get(u.role, 1), 1e-12))
+                                 for u in model.units)
     return model
+
+
+def understand(elements: list[Element], W: float, H: float) -> DesignModel:
+    units = _merge_logo_sets(build_units(elements, W, H), W, H)
+    _classify(units, W, H)
+    return _refresh(DesignModel(width=W, height=H, units=units))
+
+
+def interpretations(model: DesignModel, limit: int = 4, ambiguity_margin: float = .30) -> list[DesignModel]:
+    """Bounded beam search over uncertain roles, with stable lexical ties.
+
+    Preserve the original model as candidate zero. Only uncertain units branch;
+    explicit membership is shared unchanged, and every model owns its metadata.
+    At most one primary hero/headline is allowed in alternative assignments.
+    """
+    limit = max(1, min(int(limit), 8))
+    baseline = tuple(u.role for u in model.units)
+    beam = [(0.0, ())]
+    for u in model.units:
+        ranked = sorted(u.role_scores.items(), key=lambda item: (-item[1], item[0]))
+        options = [(u.role, u.role_scores.get(u.role, 1.0))]
+        if len(ranked) > 1 and ranked[0][1] - ranked[1][1] <= ambiguity_margin:
+            options = [(r, p) for r, p in ranked[:3] if p >= .10 and (r != "decoration" or p >= .25)]
+            if u.role not in dict(options):
+                options.append((u.role, u.role_scores[u.role]))
+        expanded = []
+        for logp, roles in beam:
+            for role, prob in options:
+                if role in ("hero", "headline") and role in roles:
+                    continue
+                expanded.append((logp + math.log(max(prob, 1e-12)), roles + (role,)))
+        beam = sorted(expanded, key=lambda x: (-x[0], x[1]))[:max(16, limit * 4)]
+    result = [model]
+    for _, assignment in beam:
+        if assignment == baseline or len(result) >= limit:
+            continue
+        alt = copy.deepcopy(model)
+        for u, role in zip(alt.units, assignment):
+            u.role = role
+        result.append(_refresh(alt))
+    if os.environ.get("CHAMELEON_DEBUG"):
+        print(f"[interpret] generated {len(result)} interpretations", file=sys.stderr)
+        for i, alt in enumerate(result):
+            print(f"[interpret {i}] " + " ".join(f"{u.id}={u.role}" for u in alt.units), file=sys.stderr)
+    return result

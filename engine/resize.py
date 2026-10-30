@@ -21,7 +21,7 @@ import os
 import sys
 from typing import Any, Callable
 
-from engine import check
+from engine import check, reflow
 from engine.fallback import last_resort, safe_layout
 from engine.normalize import Element, normalize_canvas, normalize_elements
 from engine.reflow import reflow_layout
@@ -86,6 +86,8 @@ def _debug(msg: str) -> None:
 
 
 def resize(source: dict[str, Any], target_canvas: dict[str, Any]) -> dict[str, Any]:
+    reflow.last_choice = None
+    reflow.last_stats = {}
     notes: list[str] = []
     try:
         source = source if isinstance(source, dict) else {}

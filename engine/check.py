@@ -17,6 +17,10 @@ ASPECT_TOLERANCE = 0.04  # stricter than the 5% rule, to leave rounding room
 def problems(layout: list[Element], source: list[Element], W: float, H: float,
              check_text: bool = True) -> list[str]:
     found: list[str] = []
+    if len(layout) != len(source):
+        found.append("element count changed")
+    if [e.id for e in layout] != [e.id for e in source]:
+        found.append("element IDs or order changed")
     for el, src in zip(layout, source):
         if (el.x < -EDGE_TOLERANCE or el.y < -EDGE_TOLERANCE
                 or el.x + el.width > W + EDGE_TOLERANCE or el.y + el.height > H + EDGE_TOLERANCE):

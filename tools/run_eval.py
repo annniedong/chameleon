@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from tools import baselines, tasks
+from engine import reflow
 from tools.validate import Issue, errors, validate
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -93,6 +94,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--engine", default="engine.resize:resize")
     ap.add_argument("--render", action="store_true")
+    ap.add_argument("--out", type=Path, help="separate run directory; includes task/output JSON and metrics")
     ap.add_argument("--only", default="")
     ap.add_argument("--no-mutations", action="store_true")
     ap.add_argument("--verbose", "-v", action="store_true")
@@ -100,7 +102,7 @@ def main() -> int:
 
     engine = load_engine(args.engine)
     label = args.engine.split(":")[0].replace("engine.", "").replace(".", "_")
-    out_dir = ROOT / "build" / "eval" / label
+    out_dir = args.out or ROOT / "build" / "eval" / label
     out_dir.mkdir(parents=True, exist_ok=True)
 
     all_tasks = [t for t in tasks.generate(include_mutations=not args.no_mutations) if args.only in t["task_id"]]
@@ -111,9 +113,19 @@ def main() -> int:
     times: list[float] = []
     renders: list[tuple[str, Path]] = []
 
+    metrics = []
+    (out_dir / "outputs").mkdir(exist_ok=True)
     for task in all_tasks:
+        reflow.last_stats = {}
         output, issues, elapsed, crash = run_task(engine, task)
         times.append(elapsed)
+        record = {"task_id": task["task_id"], "seconds": elapsed,
+                  "errors": [str(i) for i in issues if i.severity == "error"],
+                  "warnings": [str(i) for i in issues if i.severity == "warn"],
+                  "search": dict(getattr(reflow, "last_stats", {})), "render_error": None}
+        metrics.append(record)
+        (out_dir / "outputs" / (task["task_id"] + ".json")).write_text(
+            json.dumps({"task": task, "output": output}, indent=2, allow_nan=False))
         crashes += crash is not None
         errs = errors(issues)
         err_codes.update(i.code for i in errs)
@@ -131,10 +143,14 @@ def main() -> int:
             png = out_dir / f"{task['task_id']}.png"
             try:
                 render_design_to_png(output, ASSETS_DIR, png)
+                (out_dir / "sources").mkdir(exist_ok=True)
+                render_design_to_png(task["source"], ASSETS_DIR, out_dir / "sources" / png.name)
                 renders.append((task["task_id"], png))
             except Exception as exc:
+                record["render_error"] = str(exc)
                 print(f"       render failed: {exc}")
 
+    (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
     n = len(all_tasks)
     lines = [
         f"# Eval: {args.engine}",
