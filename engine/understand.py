@@ -442,6 +442,15 @@ def _softmax(logits: dict[str, float]) -> dict[str, float]:
     return {r: v / total for r, v in weights.items()}
 
 
+def _carries_content(u: Unit, units: list[Unit]) -> bool:
+    """True when another unit is drawn above `u` and sits inside it."""
+    def depth(el: Element) -> tuple[int, int]:
+        return (el.z_index, el.index)
+    top = max(depth(m) for m in u.members)
+    return any(depth(m) > top and any(_contains(b, m) for b in u.members)
+               for o in units if o is not u for m in o.members)
+
+
 PROMO = re.compile(r"[$\u20ac\u00a3\u00a5\u20b9]|\d\s*%|\b(off|sale|free|only|save)\b", re.I)
 
 
@@ -484,9 +493,10 @@ def _classify(units: list[Unit], W: float, H: float) -> None:
                     logits["decoration"] += 3.0
                 if opacity < .6:
                     logits["hero"] -= 2
-            # Large size alone cannot exclude an element from the layout.
+            # Large size alone cannot exclude an element from the layout, but
+            # a large panel with other content drawn on top of it is a backdrop.
             if area >= .85:
-                logits["background"] = 1.0 + 2.5 * full
+                logits["background"] = (6.0 if _carries_content(u, units) else 1.0) + 2.5 * full
                 logits["background"] += 2 * any(m.props.get("fit") == "cover" for m in u.members)
                 logits["background"] += 1.5 * any(w in names for w in ("bg", "background"))
                 if shape and full:

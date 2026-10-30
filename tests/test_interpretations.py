@@ -143,6 +143,13 @@ def test_weak_background_evidence_cannot_remove_foreground():
     assert base.units[0].role != "background"
 
 
+def test_large_panel_with_content_on_top_is_background():
+    base = model([image("panel", 30, 30, 940, 940),
+                  image("photo", 300, 300, 400, 400),
+                  _text("heading", "Fleur de sel", 100, 60, 800, 80, 60)])
+    assert next(u for u in base.units if u.id == "panel").role == "background"
+
+
 def test_contain_background_keeps_aspect():
     base = model([image("bg", 0, 0, 1000, 1000, "background.png")])
     els = copy.deepcopy(base.units[0].members)
